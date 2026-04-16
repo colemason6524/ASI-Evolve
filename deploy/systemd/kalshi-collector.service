@@ -1,0 +1,21 @@
+[Unit]
+Description=Kalshi Research Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ultimate_ai
+Environment=PYTHON_BIN=python3
+Environment=DATASET_ROOT=/opt/ultimate_ai/data/kalshi
+Environment=WATCHLIST_PATH=/opt/ultimate_ai/data/kalshi/watchlist.json
+Environment=INTERVAL_SECONDS=300
+ExecStart=/opt/ultimate_ai/scripts/run_kalshi_collector.sh
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/ultimate_ai/data/kalshi/logs/systemd-collector.log
+StandardError=append:/opt/ultimate_ai/data/kalshi/logs/systemd-collector.log
+
+[Install]
+WantedBy=multi-user.target

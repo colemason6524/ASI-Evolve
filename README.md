@@ -214,6 +214,19 @@ ASI-Evolve will iterate through scheduling policies — from simple heuristics t
 
 ---
 
+## Kalshi Collector Ops
+
+The lightweight Kalshi research collector in this repo is best run on an always-on VM, not a laptop. If you want a durable setup with `tmux` for interactive access and `systemd` for continuous collection, use the VM runbook here:
+
+- [`docs/kalshi-vm-setup.md`](docs/kalshi-vm-setup.md)
+
+The helper entrypoint and service template are included here:
+
+- `scripts/run_kalshi_collector.sh`
+- `deploy/systemd/kalshi-collector.service`
+
+---
+
 ## Repository Layout
 
 ```
