@@ -64,6 +64,11 @@ class KalshiCollector:
         self.logs_dir = dataset_root / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.forecast_lookback_days = 30
+        self.forecast_refresh_seconds = 6 * 60 * 60
+        self.cache_max_age_seconds = 12 * 60 * 60
+        self.resolved_cache_path = self.paths["scratch"] / "resolved_markets_cache.json"
+        self.resolved_market_cache = self._load_resolved_cache()
+        self.last_forecast_fetch_at: dict[str, float] = {}
 
     def collect_once(self) -> CollectionResult:
         watchlist = [market for market in load_watchlist(self.watchlist_path) if market.active]
@@ -89,11 +94,13 @@ class KalshiCollector:
                     except Exception as exc:
                         failures.append(f"social:{resolved.watchlist_label}:{exc}")
                         self._log_event("social_error", resolved.watchlist_label, {"error": str(exc)})
-                    try:
-                        forecast_points.extend(self.fetch_forecast_history(resolved))
-                    except Exception as exc:
-                        failures.append(f"forecast:{resolved.watchlist_label}:{exc}")
-                        self._log_event("forecast_error", resolved.watchlist_label, {"error": str(exc)})
+                    if self.should_refresh_forecast(resolved):
+                        try:
+                            forecast_points.extend(self.fetch_forecast_history(resolved))
+                            self.last_forecast_fetch_at[resolved.market_ticker] = time.time()
+                        except Exception as exc:
+                            failures.append(f"forecast:{resolved.watchlist_label}:{exc}")
+                            self._log_event("forecast_error", resolved.watchlist_label, {"error": str(exc)})
             except Exception as exc:
                 failures.append(f"resolve:{market.label}:{exc}")
                 self._log_event("resolve_error", market.label, {"error": str(exc)})
@@ -161,6 +168,7 @@ class KalshiCollector:
                 for item in selected
             ]
             if selected:
+                self._cache_resolved_batch(market.label, resolved)
                 self._write_raw_json(
                     f"{market.label}-markets",
                     {"markets": selected},
@@ -171,9 +179,15 @@ class KalshiCollector:
             self._log_event("fetch_http_error", market.label, {"code": exc.code, "url": market.market_url})
             if exc.code != 429:
                 raise
+            cached = self.resolve_market_from_cache(market)
+            if cached is not None:
+                return cached
             return self.resolve_market_from_bootstrap_fallback(market, exc)
         except URLError as exc:
             self._log_event("fetch_url_error", market.label, {"error": str(exc.reason), "url": market.market_url})
+            cached = self.resolve_market_from_cache(market)
+            if cached is not None:
+                return cached
             return self.resolve_market_from_bootstrap_fallback(market, exc)
 
     def resolve_market_from_bootstrap_fallback(
@@ -255,6 +269,51 @@ class KalshiCollector:
         if isinstance(payload, dict) and payload.get("ticker"):
             return payload
         return None
+
+    def resolve_market_from_cache(
+        self,
+        watchlist: WatchlistMarket,
+    ) -> Optional[tuple[list[ResolvedWatchMarket], list[NormalizedSnapshot]]]:
+        cached = self._load_cached_resolved_batch(watchlist.label)
+        if not cached:
+            return None
+
+        refreshed_markets: list[dict[str, Any]] = []
+        refreshed_resolved: list[ResolvedWatchMarket] = []
+        refreshed_snapshots: list[NormalizedSnapshot] = []
+        for item in cached:
+            market_payload = self.fetch_market_v2(item.market_ticker)
+            if market_payload is None:
+                continue
+            refreshed_markets.append(market_payload)
+            refreshed_snapshots.append(self.snapshot_from_market_v2(market_payload, watchlist))
+            refreshed_resolved.append(
+                ResolvedWatchMarket(
+                    watchlist_label=watchlist.label,
+                    category=watchlist.category,
+                    title=str(market_payload.get("title") or item.title or watchlist.title),
+                    market_url=watchlist.market_url,
+                    market_id=str(market_payload.get("id") or item.market_id),
+                    market_ticker=str(market_payload.get("ticker") or item.market_ticker),
+                    event_ticker=str(market_payload.get("event_ticker") or item.event_ticker),
+                    series_ticker=item.series_ticker,
+                    selection_mode=watchlist.selection_mode,
+                    family_code=watchlist.family_code,
+                    notes=watchlist.notes,
+                )
+            )
+
+        if not refreshed_resolved:
+            return None
+
+        self._cache_resolved_batch(watchlist.label, refreshed_resolved)
+        self._write_raw_json(
+            f"{watchlist.label}-markets-cache",
+            {"markets": refreshed_markets},
+            refreshed_snapshots[0].timestamp,
+        )
+        self._log_event("resolve_cache_hit", watchlist.label, {"market_count": len(refreshed_resolved)})
+        return refreshed_resolved, refreshed_snapshots
 
     def select_markets(self, markets: list[dict[str, Any]], watchlist: WatchlistMarket) -> list[dict[str, Any]]:
         if watchlist.selection_mode == "fixed":
@@ -380,6 +439,12 @@ class KalshiCollector:
                 )
             )
         return points
+
+    def should_refresh_forecast(self, market: ResolvedWatchMarket) -> bool:
+        last_refresh = self.last_forecast_fetch_at.get(market.market_ticker)
+        if last_refresh is None:
+            return True
+        return (time.time() - last_refresh) >= self.forecast_refresh_seconds
 
     def fetch_social_trades(self, market: ResolvedWatchMarket) -> list[SocialTradeRecord]:
         payload = self.fetch_json(
@@ -788,6 +853,56 @@ class KalshiCollector:
 
     def _is_uuid_like(self, value: str) -> bool:
         return bool(re.fullmatch(r"[0-9a-fA-F-]{36}", value))
+
+    def _cache_resolved_batch(self, watchlist_label: str, resolved: list[ResolvedWatchMarket]) -> None:
+        self.resolved_market_cache[watchlist_label] = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "markets": [
+                {
+                    "watchlist_label": item.watchlist_label,
+                    "category": item.category,
+                    "title": item.title,
+                    "market_url": item.market_url,
+                    "market_id": item.market_id,
+                    "market_ticker": item.market_ticker,
+                    "event_ticker": item.event_ticker,
+                    "series_ticker": item.series_ticker,
+                    "selection_mode": item.selection_mode,
+                    "family_code": item.family_code,
+                    "notes": item.notes,
+                }
+                for item in resolved
+            ],
+        }
+        self._write_resolved_cache()
+
+    def _load_cached_resolved_batch(self, watchlist_label: str) -> list[ResolvedWatchMarket]:
+        payload = self.resolved_market_cache.get(watchlist_label)
+        if not isinstance(payload, dict):
+            return []
+        updated_at = payload.get("updated_at")
+        if updated_at:
+            parsed = self._parse_datetime(str(updated_at))
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+                if age_seconds > self.cache_max_age_seconds:
+                    return []
+        markets = payload.get("markets", [])
+        return [ResolvedWatchMarket(**item) for item in markets if isinstance(item, dict)]
+
+    def _load_resolved_cache(self) -> dict[str, Any]:
+        if not self.resolved_cache_path.exists():
+            return {}
+        try:
+            return json.loads(self.resolved_cache_path.read_text())
+        except Exception:
+            return {}
+
+    def _write_resolved_cache(self) -> None:
+        self.resolved_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.resolved_cache_path.write_text(json.dumps(self.resolved_market_cache, indent=2))
 
     def _family_url(self, market_url: str) -> str:
         parsed = urlparse(market_url)
