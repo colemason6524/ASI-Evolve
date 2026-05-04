@@ -149,7 +149,33 @@ class KalshiCollector:
 
         try:
             api_markets = self.fetch_markets_v2(market)
+            self._log_family_resolution_summary(market, api_markets, phase="api_fetch")
+            if market.selection_mode == "family":
+                self._write_raw_json(
+                    f"{market.label}-markets-api",
+                    {
+                        "phase": "api_fetch",
+                        "family_code": market.family_code,
+                        "market_url": market.market_url,
+                        "api_market_count": len(api_markets),
+                        "markets": api_markets,
+                    },
+                    datetime.now(timezone.utc).astimezone(),
+                )
+                if not api_markets:
+                    fallback = self.resolve_family_from_contract_pages(market, reason="api_empty")
+                    if fallback is not None:
+                        return fallback
             selected = self.select_markets(api_markets, market)
+            self._log_family_resolution_summary(market, selected, phase="post_filter", source_count=len(api_markets))
+            if market.selection_mode == "family" and not selected:
+                fallback = self.resolve_family_from_contract_pages(
+                    market,
+                    reason="selection_empty",
+                    api_markets=api_markets,
+                )
+                if fallback is not None:
+                    return fallback
             snapshots = [self.snapshot_from_market_v2(item, market) for item in selected]
             resolved = [
                 ResolvedWatchMarket(
@@ -315,6 +341,112 @@ class KalshiCollector:
         self._log_event("resolve_cache_hit", watchlist.label, {"market_count": len(refreshed_resolved)})
         return refreshed_resolved, refreshed_snapshots
 
+    def resolve_family_from_contract_pages(
+        self,
+        watchlist: WatchlistMarket,
+        reason: str,
+        api_markets: Optional[list[dict[str, Any]]] = None,
+    ) -> Optional[tuple[list[ResolvedWatchMarket], list[NormalizedSnapshot]]]:
+        if watchlist.selection_mode != "family":
+            return None
+
+        timestamp = datetime.now(timezone.utc).astimezone()
+        family_url = self._family_url(watchlist.market_url)
+        family_code = (watchlist.family_code or "").lower()
+        try:
+            family_html = self.fetch_text(family_url)
+        except Exception as exc:
+            self._log_event(
+                "family_page_fetch_error",
+                watchlist.label,
+                {"reason": reason, "family_url": family_url, "error": str(exc)},
+            )
+            return None
+
+        contract_urls = self.extract_contract_urls(family_html, family_url, family_code)
+        self._log_event(
+            "family_page_fallback",
+            watchlist.label,
+            {
+                "reason": reason,
+                "family_url": family_url,
+                "contract_url_count": len(contract_urls),
+                "api_market_count": len(api_markets or []),
+            },
+        )
+        self._write_raw_json(
+            f"{watchlist.label}-family-page-fallback",
+            {
+                "reason": reason,
+                "family_url": family_url,
+                "family_code": watchlist.family_code,
+                "api_market_count": len(api_markets or []),
+                "contract_urls": contract_urls,
+            },
+            timestamp,
+        )
+        if not contract_urls:
+            return None
+
+        candidates: list[tuple[ResolvedWatchMarket, NormalizedSnapshot]] = []
+        for contract_url in contract_urls[: max(10, watchlist.max_active_contracts * 5)]:
+            market_ticker = self._market_id_from_url(contract_url).upper()
+            resolved = ResolvedWatchMarket(
+                watchlist_label=watchlist.label,
+                category=watchlist.category,
+                title=watchlist.title,
+                market_url=contract_url,
+                market_id=market_ticker,
+                market_ticker=market_ticker,
+                event_ticker=market_ticker,
+                series_ticker=self.derive_series_ticker(watchlist),
+                selection_mode=watchlist.selection_mode,
+                family_code=watchlist.family_code,
+                notes=watchlist.notes,
+            )
+            try:
+                contract_html = self.fetch_text(contract_url)
+                snapshot = self.parse_market_snapshot(resolved, contract_html)
+            except Exception as exc:
+                self._log_event(
+                    "family_contract_parse_error",
+                    watchlist.label,
+                    {"reason": reason, "market_ticker": market_ticker, "error": str(exc)},
+                )
+                continue
+            if not self._snapshot_within_watchlist_window(snapshot, watchlist):
+                continue
+            candidates.append((resolved, snapshot))
+
+        if not candidates:
+            self._log_event(
+                "family_page_fallback_empty",
+                watchlist.label,
+                {"reason": reason, "contract_url_count": len(contract_urls)},
+            )
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                -item[1].volume,
+                -item[1].open_interest,
+            )
+        )
+        selected = candidates[: watchlist.max_active_contracts]
+        resolved_batch = [resolved for resolved, _snapshot in selected]
+        snapshots = [snapshot for _resolved, snapshot in selected]
+        self._cache_resolved_batch(watchlist.label, resolved_batch)
+        self._log_event(
+            "family_page_fallback_success",
+            watchlist.label,
+            {
+                "reason": reason,
+                "selected_count": len(selected),
+                "market_tickers": [item.market_ticker for item in resolved_batch],
+            },
+        )
+        return resolved_batch, snapshots
+
     def select_markets(self, markets: list[dict[str, Any]], watchlist: WatchlistMarket) -> list[dict[str, Any]]:
         if watchlist.selection_mode == "fixed":
             exact_matches = self._match_fixed_markets(markets, watchlist)
@@ -341,6 +473,18 @@ class KalshiCollector:
             )
         )
         return filtered[: watchlist.max_active_contracts]
+
+    def _snapshot_within_watchlist_window(
+        self,
+        snapshot: NormalizedSnapshot,
+        watchlist: WatchlistMarket,
+    ) -> bool:
+        hours_to_close = max(0.0, snapshot.seconds_to_resolution / 3600.0)
+        if watchlist.resolution_hours_min is not None and hours_to_close < watchlist.resolution_hours_min:
+            return False
+        if watchlist.resolution_hours_max is not None and hours_to_close > watchlist.resolution_hours_max:
+            return False
+        return True
 
     def snapshot_from_market_v2(self, market: dict[str, Any], watchlist: WatchlistMarket) -> NormalizedSnapshot:
         timestamp = datetime.now(timezone.utc).astimezone()
@@ -929,6 +1073,26 @@ class KalshiCollector:
         day_dir.mkdir(parents=True, exist_ok=True)
         target = day_dir / f"{stem}.json"
         target.write_text(json.dumps(payload, indent=2, default=str))
+
+    def _log_family_resolution_summary(
+        self,
+        watchlist: WatchlistMarket,
+        markets: list[dict[str, Any]],
+        *,
+        phase: str,
+        source_count: Optional[int] = None,
+    ) -> None:
+        if watchlist.selection_mode != "family":
+            return
+        payload: dict[str, Any] = {
+            "phase": phase,
+            "family_code": watchlist.family_code,
+            "market_count": len(markets),
+            "market_tickers": [str(item.get("ticker") or item.get("event_ticker") or "") for item in markets[:10]],
+        }
+        if source_count is not None:
+            payload["source_count"] = source_count
+        self._log_event("family_resolution_summary", watchlist.label, payload)
 
     def _log_event(self, event_type: str, key: str, payload: dict[str, Any]) -> None:
         line = {
