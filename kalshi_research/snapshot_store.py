@@ -25,8 +25,8 @@ DEFAULT_WATCHLIST = [
         family_code="kxmlbgame",
         priority=1,
         max_active_contracts=2,
-        resolution_hours_min=1,
-        resolution_hours_max=24,
+        resolution_hours_min=0,
+        resolution_hours_max=72,
         notes="Track 1-3 active MLB contracts with visible liquidity.",
     ),
     WatchlistMarket(
@@ -38,8 +38,8 @@ DEFAULT_WATCHLIST = [
         family_code="kxatpchallengermatch",
         priority=2,
         max_active_contracts=2,
-        resolution_hours_min=1,
-        resolution_hours_max=24,
+        resolution_hours_min=0,
+        resolution_hours_max=48,
         notes="Tennis family for shorter event-driven markets.",
     ),
     WatchlistMarket(
@@ -51,8 +51,8 @@ DEFAULT_WATCHLIST = [
         family_code="kxcs2game",
         priority=2,
         max_active_contracts=2,
-        resolution_hours_min=1,
-        resolution_hours_max=24,
+        resolution_hours_min=0,
+        resolution_hours_max=48,
         notes="Track active CS2 matches for fast-moving esports behavior.",
     ),
     WatchlistMarket(
@@ -64,8 +64,8 @@ DEFAULT_WATCHLIST = [
         family_code="kxlolgame",
         priority=2,
         max_active_contracts=2,
-        resolution_hours_min=1,
-        resolution_hours_max=24,
+        resolution_hours_min=0,
+        resolution_hours_max=48,
         notes="Track active LoL contracts as a second esports comparison.",
     ),
     WatchlistMarket(
