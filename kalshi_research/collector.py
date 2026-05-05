@@ -459,7 +459,7 @@ class KalshiCollector:
             if status and status not in {"open", "active", "initialized"}:
                 continue
             close_ts = self._extract_close_ts(market)
-            if close_ts is not None:
+            if close_ts is not None and not self._skip_resolution_window_filter(watchlist):
                 hours_to_close = max(0.0, (close_ts - time.time()) / 3600.0)
                 if watchlist.resolution_hours_min is not None and hours_to_close < watchlist.resolution_hours_min:
                     continue
@@ -479,12 +479,25 @@ class KalshiCollector:
         snapshot: NormalizedSnapshot,
         watchlist: WatchlistMarket,
     ) -> bool:
+        if self._skip_resolution_window_filter(watchlist):
+            return True
         hours_to_close = max(0.0, snapshot.seconds_to_resolution / 3600.0)
         if watchlist.resolution_hours_min is not None and hours_to_close < watchlist.resolution_hours_min:
             return False
         if watchlist.resolution_hours_max is not None and hours_to_close > watchlist.resolution_hours_max:
             return False
         return True
+
+    def _skip_resolution_window_filter(self, watchlist: WatchlistMarket) -> bool:
+        if watchlist.selection_mode != "family":
+            return False
+        family_code = (watchlist.family_code or "").lower()
+        return family_code in {
+            "kxmlbgame",
+            "kxatpchallengermatch",
+            "kxcs2game",
+            "kxlolgame",
+        }
 
     def snapshot_from_market_v2(self, market: dict[str, Any], watchlist: WatchlistMarket) -> NormalizedSnapshot:
         timestamp = datetime.now(timezone.utc).astimezone()
